@@ -13,6 +13,7 @@ const DEBUG = params.has("debug");
 // - source "supervisory": lê os widgets do dashboard 1940 — ex.: água
 const DEVICES = [
   { id: "71987", label: "Energia", icon: "energia", source: "reading" },
+  { id: "71705", label: "Entrada Principal", icon: "energia", source: "reading" },
   { id: "71961", label: "Água", icon: "agua", source: "supervisory" },
 ];
 
@@ -318,56 +319,80 @@ async function loadReading() {
   };
 }
 
+// unidade de volume (m³, L) vs vazão (…/h)
+const isVolumeUnit = (u) => /m³$|litro|^l$/i.test(String(u || "").trim());
+const isFlowUnit = (u) => /\/h/i.test(String(u || ""));
+
 // Fonte "supervisory": dashboard 1940 (widgets). Ex.: água.
 async function loadSupervisory() {
   const sup = await fetchJSON("supervisory");
   const widgets = Array.isArray(sup?.widgets) ? sup.widgets : [];
 
-  // cards = widgets de valor atual
   const valueWidgets = widgets.filter((w) => /current_value/.test(w.widget_type || ""));
-  const cards = await Promise.all(
-    valueWidgets.map(async (w) => {
-      try {
-        const wd = await fetchJSON("widget", `&widgetId=${w.id}`);
-        return {
-          label: wd.description || w.description || "—",
-          value: wd.data?.value ?? "",
-          unit: wd.data?.unit || "",
-        };
-      } catch {
-        return { label: w.description || "—", value: "", unit: "" };
-      }
-    })
-  );
+  const lineWidgets = widgets.filter((w) => /line_chart/.test(w.widget_type || ""));
 
-  // gráfico = primeiro widget de linha com chart_data
-  let series = null;
-  const lineWidget = widgets.find((w) => /line_chart/.test(w.widget_type || ""));
-  if (lineWidget) {
-    try {
-      const wd = await fetchJSON("widget", `&widgetId=${lineWidget.id}`);
-      const cd = wd.data?.chart_data;
-      if (Array.isArray(cd) && cd.length) {
-        series = {
-          label: wd.description || "Histórico",
-          points: cd.map((p) => ({
-            x: shortTime(p.datetime),
-            y: Number(p.value) || 0,
-          })),
-        };
-      }
-    } catch {
-      /* gráfico opcional */
-    }
+  // valores atuais
+  const values = (
+    await Promise.all(
+      valueWidgets.map(async (w) => {
+        try {
+          const wd = await fetchJSON("widget", `&widgetId=${w.id}`);
+          return { label: wd.description || w.description || "—", value: wd.data?.value, unit: wd.data?.unit || "" };
+        } catch {
+          return null;
+        }
+      })
+    )
+  ).filter((v) => v && v.value != null);
+
+  const totalCard = values.find((v) => isVolumeUnit(v.unit)); // acumulador (m³)
+  const flowCard = values.find((v) => isFlowUnit(v.unit)); // vazão (m³/h)
+
+  // gráficos de linha, classificados por unidade
+  const lines = (
+    await Promise.all(
+      lineWidgets.map(async (w) => {
+        try {
+          const wd = await fetchJSON("widget", `&widgetId=${w.id}&line_chart=true`);
+          return { desc: wd.description, unit: wd.data?.unit || "", cd: wd.data?.chart_data || [] };
+        } catch {
+          return null;
+        }
+      })
+    )
+  ).filter((l) => l && l.cd.length);
+
+  const accumLine = lines.find((l) => isVolumeUnit(l.unit)); // hidrômetro (m³)
+  const flowLine = lines.find((l) => isFlowUnit(l.unit)); // vazão (m³/h)
+
+  // Consumo Hoje = variação do hidrômetro na janela de hoje (offset se cancela)
+  let hoje = null;
+  if (accumLine && accumLine.cd.length >= 2) {
+    const first = Number(accumLine.cd[0].value);
+    const last = Number(accumLine.cd[accumLine.cd.length - 1].value);
+    if (Number.isFinite(first) && Number.isFinite(last)) hoje = Math.max(0, last - first);
   }
 
-  const last = valueWidgets[0]?.last_report || sup?.last_report || nowLabel();
+  const fields = [];
+  if (hoje != null) fields.push({ label: "Consumo Hoje", value: hoje.toFixed(2), unit: totalCard?.unit || "m³" });
+  if (totalCard) fields.push({ label: "Consumo Total", value: totalCard.value, unit: totalCard.unit });
+  if (flowCard) fields.push({ label: "Vazão", value: flowCard.value, unit: flowCard.unit });
+
+  // gráfico principal: vazão (fluxo); cai para o acumulador se não houver
+  const chartSrc = flowLine || accumLine;
+  const series = chartSrc
+    ? {
+        label: chartSrc.desc || "Histórico",
+        points: chartSrc.cd.map((p) => ({ x: shortTime(p.datetime), y: Number(p.value) || 0 })),
+      }
+    : null;
+
   return {
-    fields: cards,
+    fields,
     series,
     name: activeDevice.label,
-    sub: sup?.description ? `${sup.description}` : "LifeSense · supervisório",
-    last,
+    sub: sup?.description || "LifeSense · supervisório",
+    last: valueWidgets[0]?.last_report || sup?.last_report || nowLabel(),
     debug: sup,
   };
 }

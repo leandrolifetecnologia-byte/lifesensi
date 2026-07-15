@@ -99,7 +99,7 @@ export async function handler(event) {
 
     // Allowlist de dispositivos que a página pode consultar. Evita que a função
     // pública seja usada para enumerar/ler qualquer locationId da conta.
-    const allowed = (process.env.METAM_LOCATION_IDS || "71987,71961")
+    const allowed = (process.env.METAM_LOCATION_IDS || "71987,71961,71705")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
@@ -124,15 +124,23 @@ export async function handler(event) {
       case "fields": // definição/metadados dos campos do device
         data = await api(`/last-report/fields/${locationId}`);
         break;
-      case "history": // série histórica para os gráficos
-        data = await api(`/equipment/${equipmentId}/history`);
+      case "history": // série histórica (equipmentId vem dos widgets do supervisório)
+        data = await api(`/equipment/${q.equipmentId || equipmentId}/history`);
         break;
       case "supervisory": // config do dashboard (widgets)
         data = await api(`/supervisory/${supervisoryId}`);
         break;
-      case "widget": // valor atual de um widget do supervisório
-        data = await api(`/supervisory/${supervisoryId}/widget/${q.widgetId}`);
+      case "widget": {
+        // valor de um widget; period_view opcional (24_hours|day|week|month)
+        const wq = new URLSearchParams();
+        if (q.period_view) wq.set("period_view", q.period_view);
+        if (q.line_chart) wq.set("line_chart", q.line_chart);
+        const qs = wq.toString();
+        data = await api(
+          `/supervisory/${supervisoryId}/widget/${q.widgetId}${qs ? "?" + qs : ""}`
+        );
         break;
+      }
       case "all": // conveniência para inspeção: leitura + campos juntos
         {
           const [reading, fields] = await Promise.all([
