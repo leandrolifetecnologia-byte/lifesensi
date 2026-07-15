@@ -1,0 +1,14 @@
+{
+  "name": "metam-supervisorio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Supervisório web (Life Tecnologia) lendo telemetria da plataforma Metam via função serverless Netlify.",
+  "type": "module",
+  "scripts": {
+    "dev": "netlify dev",
+    "start": "netlify dev"
+  },
+  "devDependencies": {
+    "netlify-cli": "^17"
+  }
+}

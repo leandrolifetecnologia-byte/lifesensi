@@ -1,0 +1,319 @@
+// Supervisório LifeSense — front-end.
+// Busca a leitura via função serverless (/api/metam) e renderiza os cards.
+// É deliberadamente tolerante ao formato: o shape exato do /last-report do Metam
+// é normalizado em { label, value, unit, secondary } antes de exibir.
+
+const REFRESH_MS = 60_000;
+const API = "/api/metam";
+const params = new URLSearchParams(location.search);
+const DEBUG = params.has("debug");
+
+const el = (id) => document.getElementById(id);
+let chart = null;
+let timer = null;
+
+/* ---------------- utilidades ---------------- */
+
+async function fetchJSON(action, extra = "") {
+  const r = await fetch(`${API}?action=${action}${extra}`, { cache: "no-store" });
+  const text = await r.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Resposta inválida (${r.status}): ${text.slice(0, 120)}`);
+  }
+  if (!r.ok || data?.error) {
+    throw new Error(data?.error || `HTTP ${r.status}`);
+  }
+  return data;
+}
+
+function setStatus(state, text) {
+  const s = el("status");
+  s.classList.remove("ok", "bad");
+  if (state) s.classList.add(state);
+  el("statusText").textContent = text;
+}
+
+function fmtNumber(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  // até 2 casas, sem zeros à toa
+  return n.toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+}
+
+function nowLabel() {
+  return new Date().toLocaleTimeString("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/* ---------------- normalização ---------------- */
+
+// Tenta achar um array de campos dentro de qualquer estrutura devolvida.
+function findFieldArray(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== "object") return null;
+  for (const key of ["fields", "data", "custom_fields", "customFields", "items", "values", "measurements"]) {
+    if (Array.isArray(data[key])) return data[key];
+  }
+  return null;
+}
+
+const LABEL_KEYS = ["name", "label", "title", "field", "field_name", "description", "key"];
+const VALUE_KEYS = ["value", "val", "last_value", "lastValue", "current", "reading", "measure"];
+const UNIT_KEYS = ["unit", "measure", "unit_measure", "unitMeasure", "symbol", "uom"];
+
+function pick(obj, keys) {
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== "") return obj[k];
+  }
+  return undefined;
+}
+
+function normalize(reading) {
+  const out = [];
+  const arr = findFieldArray(reading);
+
+  if (arr) {
+    for (const item of arr) {
+      if (item == null) continue;
+      if (typeof item !== "object") {
+        out.push({ label: String(item), value: "", unit: "" });
+        continue;
+      }
+      const label = pick(item, LABEL_KEYS);
+      let value = pick(item, VALUE_KEYS);
+      const unit = pick(item, UNIT_KEYS);
+      if (value === undefined) {
+        // objeto sem chave "value" óbvia: pega o primeiro número
+        const numKey = Object.keys(item).find((k) => typeof item[k] === "number");
+        if (numKey) value = item[numKey];
+      }
+      if (label === undefined && value === undefined) continue;
+      out.push({
+        label: label != null ? String(label) : "—",
+        value: value != null ? value : "",
+        unit: unit != null ? String(unit) : "",
+      });
+    }
+    return out;
+  }
+
+  // Objeto plano: chave → valor primitivo
+  if (reading && typeof reading === "object") {
+    for (const [k, v] of Object.entries(reading)) {
+      if (v == null || typeof v === "object") continue;
+      out.push({ label: k, value: v, unit: "" });
+    }
+  }
+  return out;
+}
+
+/* ---------------- ícones ---------------- */
+
+const ICONS = {
+  consumo: `<path d="M12 2a7 7 0 0 0-7 7c0 3 2 5 3.5 7 .8 1 1.5 2 1.5 3h4c0-1 .7-2 1.5-3C17 14 19 12 19 9a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9 21h6" stroke="currentColor" stroke-width="1.7"/>`,
+  vazao: `<path d="M4 8c3-2 5 2 8 0s5-2 8 0M4 14c3-2 5 2 8 0s5-2 8 0M4 20c3-2 5 2 8 0s5-2 8 0" fill="none" stroke="currentColor" stroke-width="1.7"/>`,
+  agua: `<path d="M12 3c4 5 6 8 6 11a6 6 0 1 1-12 0c0-3 2-6 6-11z" fill="none" stroke="currentColor" stroke-width="1.7"/>`,
+  energia: `<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" fill="none" stroke="currentColor" stroke-width="1.7"/>`,
+  tensao: `<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" fill="none" stroke="currentColor" stroke-width="1.7"/>`,
+  temperatura: `<path d="M14 14V5a2 2 0 1 0-4 0v9a4 4 0 1 0 4 0z" fill="none" stroke="currentColor" stroke-width="1.7"/>`,
+  sinal: `<path d="M4 20v-4M9 20v-8M14 20v-12M19 20V4" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round"/>`,
+  padrao: `<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 8v5l3 2" stroke="currentColor" stroke-width="1.7" fill="none"/>`,
+};
+
+function iconFor(label) {
+  const l = (label || "").toLowerCase();
+  if (l.includes("vaz")) return ICONS.vazao;
+  if (l.includes("consum")) return ICONS.consumo;
+  if (l.includes("água") || l.includes("agua") || l.includes("litro")) return ICONS.agua;
+  if (l.includes("tens") || l.includes("volt")) return ICONS.tensao;
+  if (l.includes("energ") || l.includes("pot") || l.includes("kwh") || l.includes("watt")) return ICONS.energia;
+  if (l.includes("temp")) return ICONS.temperatura;
+  if (l.includes("sinal") || l.includes("rssi") || l.includes("wifi")) return ICONS.sinal;
+  return ICONS.padrao;
+}
+
+/* ---------------- render ---------------- */
+
+function renderCards(fields) {
+  const wrap = el("cards");
+  if (!fields.length) {
+    wrap.innerHTML = `<div class="banner">Nenhum campo retornado pela API. Abra <a href="?debug=1">?debug=1</a> para ver a resposta bruta.</div>`;
+    return;
+  }
+  wrap.innerHTML = fields
+    .map((f) => {
+      const value = f.value === "" ? "—" : fmtNumber(f.value);
+      const unit = f.unit ? `<span class="c-unit">${escapeHtml(f.unit)}</span>` : "";
+      return `
+        <div class="card">
+          <div class="c-top">
+            <span class="c-label">${escapeHtml(f.label)}</span>
+            <span class="c-icon"><svg viewBox="0 0 24 24">${iconFor(f.label)}</svg></span>
+          </div>
+          <div class="c-value">${escapeHtml(value)}${unit}</div>
+        </div>`;
+    })
+    .join("");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+/* ---------------- histórico (gráfico) ---------------- */
+
+async function ensureChartJs() {
+  if (window.Chart) return true;
+  try {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("Falha ao carregar Chart.js"));
+      document.head.appendChild(s);
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Extrai pares {x, y} de uma estrutura de histórico desconhecida.
+function extractSeries(history) {
+  const arr = findFieldArray(history) || (Array.isArray(history) ? history : null);
+  if (!arr || !arr.length) return null;
+  const points = [];
+  for (const row of arr) {
+    if (row == null || typeof row !== "object") continue;
+    const t =
+      row.timestamp || row.date || row.datetime || row.time || row.created_at || row.x;
+    const yKey = Object.keys(row).find(
+      (k) => typeof row[k] === "number" && !/id$/i.test(k)
+    );
+    if (t == null || yKey == null) continue;
+    points.push({ x: t, y: row[yKey] });
+  }
+  return points.length ? points : null;
+}
+
+async function renderHistory() {
+  let history;
+  try {
+    history = await fetchJSON("history");
+  } catch {
+    return; // histórico é opcional; silencioso se não existir
+  }
+  const series = extractSeries(history);
+  if (!series) return;
+  if (!(await ensureChartJs())) return;
+
+  el("chartCard").hidden = false;
+  el("chartSub").textContent = `${series.length} leituras`;
+  const ctx = el("historyChart").getContext("2d");
+  const labels = series.map((p) =>
+    new Date(p.x).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+  );
+  const data = series.map((p) => p.y);
+
+  if (chart) chart.destroy();
+  chart = new window.Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          data,
+          borderColor: "#844fff",
+          backgroundColor: "rgba(132,79,255,0.15)",
+          borderWidth: 2,
+          fill: true,
+          tension: 0.35,
+          pointRadius: 0,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: "#8b93a6", maxTicksLimit: 8 }, grid: { color: "rgba(34,48,80,0.4)" } },
+        y: { ticks: { color: "#8b93a6" }, grid: { color: "rgba(34,48,80,0.4)" } },
+      },
+    },
+  });
+}
+
+/* ---------------- ciclo principal ---------------- */
+
+async function refresh() {
+  try {
+    const reading = await fetchJSON("reading");
+    const fields = normalize(reading);
+    renderCards(fields);
+
+    // nome do device: tenta achar algo textual
+    const name =
+      reading?.name || reading?.equipment_name || reading?.device_name || "Medidor de Água";
+    el("deviceName").textContent = name;
+    el("deviceSub").textContent = "LifeSense · leitura em tempo real";
+
+    el("lastUpdate").textContent = nowLabel();
+    setStatus("ok", "Online");
+
+    if (DEBUG) el("rawJson").textContent = JSON.stringify(reading, null, 2);
+  } catch (e) {
+    setStatus("bad", "Falha na leitura");
+    showError(e.message);
+    if (DEBUG) el("rawJson").textContent = "ERRO: " + e.message;
+  }
+}
+
+function showError(msg) {
+  let b = document.querySelector(".banner.live");
+  if (!b) {
+    b = document.createElement("div");
+    b.className = "banner live";
+    el("cards").before(b);
+  }
+  b.textContent = "Erro: " + msg;
+}
+
+function init() {
+  el("intervalLabel").textContent = String(REFRESH_MS / 1000);
+  if (DEBUG) el("debug").hidden = false;
+
+  el("copyRaw")?.addEventListener("click", () => {
+    navigator.clipboard?.writeText(el("rawJson").textContent || "");
+  });
+
+  refresh();
+  renderHistory();
+  timer = setInterval(() => {
+    refresh();
+    renderHistory();
+  }, REFRESH_MS);
+
+  // pausa quando a aba não está visível (economia)
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearInterval(timer);
+    } else {
+      refresh();
+      timer = setInterval(() => {
+        refresh();
+        renderHistory();
+      }, REFRESH_MS);
+    }
+  });
+}
+
+init();

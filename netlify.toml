@@ -1,0 +1,9 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+# Deixa a página chamar a função por um caminho curto: /api/metam
+[[redirects]]
+  from = "/api/metam"
+  to = "/.netlify/functions/metam"
+  status = 200
