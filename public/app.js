@@ -74,7 +74,30 @@ function pick(obj, keys) {
   return undefined;
 }
 
+// "477.90 W" -> { value: "477.90", unit: "W" } · "0.89  " -> { value: "0.89", unit: "" }
+function splitValueUnit(raw) {
+  if (raw == null) return { value: "", unit: "" };
+  const s = String(raw).trim();
+  const m = s.match(/^(-?\d[\d.,]*)\s*(.*)$/);
+  if (m) return { value: m[1], unit: (m[2] || "").trim() };
+  return { value: s, unit: "" };
+}
+
 function normalize(reading) {
+  // Formato real do Metam: custom_fields[].reports[0].correct_signal_level ("477.90 W").
+  const cf = reading?.custom_fields;
+  if (Array.isArray(cf) && cf.length) {
+    return cf.map((f) => {
+      const label = (f.description || "—").toString().trim();
+      const latest =
+        Array.isArray(f.reports) && f.reports.length
+          ? f.reports[0].correct_signal_level
+          : "";
+      const { value, unit } = splitValueUnit(latest);
+      return { label, value, unit };
+    });
+  }
+
   const out = [];
   const arr = findFieldArray(reading);
 
@@ -186,42 +209,52 @@ async function ensureChartJs() {
   }
 }
 
-// Extrai pares {x, y} de uma estrutura de histórico desconhecida.
-function extractSeries(history) {
-  const arr = findFieldArray(history) || (Array.isArray(history) ? history : null);
-  if (!arr || !arr.length) return null;
-  const points = [];
-  for (const row of arr) {
-    if (row == null || typeof row !== "object") continue;
-    const t =
-      row.timestamp || row.date || row.datetime || row.time || row.created_at || row.x;
-    const yKey = Object.keys(row).find(
-      (k) => typeof row[k] === "number" && !/id$/i.test(k)
-    );
-    if (t == null || yKey == null) continue;
-    points.push({ x: t, y: row[yKey] });
-  }
-  return points.length ? points : null;
+// "15/07/2026 18:01:00" -> "18:01"
+function shortTime(metamDate) {
+  const m = String(metamDate || "").match(/(\d{2}):(\d{2})/);
+  return m ? `${m[1]}:${m[2]}` : String(metamDate || "");
 }
 
-async function renderHistory() {
-  let history;
-  try {
-    history = await fetchJSON("history");
-  } catch {
-    return; // histórico é opcional; silencioso se não existir
+const CHART_PRIORITY = ["consum", "energia", "potenc", "vaz"];
+
+// Escolhe um campo interessante e monta a série a partir dos reports embutidos.
+function buildSeries(reading) {
+  const cf = reading?.custom_fields;
+  if (!Array.isArray(cf) || !cf.length) return null;
+
+  const usable = cf.filter((f) => Array.isArray(f.reports) && f.reports.length >= 2);
+  if (!usable.length) return null;
+
+  let chosen = null;
+  for (const key of CHART_PRIORITY) {
+    chosen = usable.find((f) => (f.description || "").toLowerCase().includes(key));
+    if (chosen) break;
   }
-  const series = extractSeries(history);
+  if (!chosen) chosen = usable[0];
+
+  // reports vêm do mais recente para o mais antigo -> inverter para cronológico
+  const rows = [...chosen.reports].reverse();
+  const points = rows
+    .map((r) => {
+      const { value } = splitValueUnit(r.correct_signal_level);
+      const y = Number(String(value).replace(",", "."));
+      return Number.isFinite(y) ? { x: shortTime(r.report_date), y } : null;
+    })
+    .filter(Boolean);
+
+  return points.length ? { label: (chosen.description || "").trim(), points } : null;
+}
+
+async function renderHistory(reading) {
+  const series = buildSeries(reading);
   if (!series) return;
   if (!(await ensureChartJs())) return;
 
   el("chartCard").hidden = false;
-  el("chartSub").textContent = `${series.length} leituras`;
+  el("chartSub").textContent = `${series.label} · ${series.points.length} leituras`;
   const ctx = el("historyChart").getContext("2d");
-  const labels = series.map((p) =>
-    new Date(p.x).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
-  );
-  const data = series.map((p) => p.y);
+  const labels = series.points.map((p) => p.x);
+  const data = series.points.map((p) => p.y);
 
   if (chart) chart.destroy();
   chart = new window.Chart(ctx, {
@@ -259,15 +292,25 @@ async function refresh() {
     const reading = await fetchJSON("reading");
     const fields = normalize(reading);
     renderCards(fields);
+    renderHistory(reading);
 
-    // nome do device: tenta achar algo textual
     const name =
-      reading?.name || reading?.equipment_name || reading?.device_name || "Medidor de Água";
+      reading?.installation_location_description ||
+      reading?.client_name ||
+      reading?.name ||
+      "Dispositivo";
+    const client = reading?.client_name;
     el("deviceName").textContent = name;
-    el("deviceSub").textContent = "LifeSense · leitura em tempo real";
+    el("deviceSub").textContent = client
+      ? `${client} · IMEI ${reading?.imei || "—"}`
+      : "LifeSense · leitura em tempo real";
 
-    el("lastUpdate").textContent = nowLabel();
+    // usa o horário do próprio relatório do Metam quando disponível
+    el("lastUpdate").textContent = reading?.last_report_date || nowLabel();
     setStatus("ok", "Online");
+
+    // limpa banner de erro anterior, se houver
+    document.querySelector(".banner.live")?.remove();
 
     if (DEBUG) el("rawJson").textContent = JSON.stringify(reading, null, 2);
   } catch (e) {
@@ -295,12 +338,8 @@ function init() {
     navigator.clipboard?.writeText(el("rawJson").textContent || "");
   });
 
-  refresh();
-  renderHistory();
-  timer = setInterval(() => {
-    refresh();
-    renderHistory();
-  }, REFRESH_MS);
+  refresh(); // refresh() já alimenta cards e gráfico com a mesma leitura
+  timer = setInterval(refresh, REFRESH_MS);
 
   // pausa quando a aba não está visível (economia)
   document.addEventListener("visibilitychange", () => {
@@ -308,10 +347,7 @@ function init() {
       clearInterval(timer);
     } else {
       refresh();
-      timer = setInterval(() => {
-        refresh();
-        renderHistory();
-      }, REFRESH_MS);
+      timer = setInterval(refresh, REFRESH_MS);
     }
   });
 }
