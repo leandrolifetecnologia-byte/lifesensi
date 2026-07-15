@@ -3,6 +3,8 @@
 // É deliberadamente tolerante ao formato: o shape exato do /last-report do Metam
 // é normalizado em { label, value, unit, secondary } antes de exibir.
 
+import { FATURAS, tarifaEfetiva } from "./faturas.js";
+
 const REFRESH_MS = 60_000;
 const API = "/api/metam";
 const params = new URLSearchParams(location.search);
@@ -46,6 +48,9 @@ function setStatus(state, text) {
   if (state) s.classList.add(state);
   el("statusText").textContent = text;
 }
+
+const fmtBRL = (n) =>
+  Number(n).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 
 function fmtNumber(v) {
   const n = Number(v);
@@ -408,6 +413,7 @@ async function refresh() {
 
     renderCards(result.fields);
     drawChart(result.series);
+    renderBilling(activeDevice, result);
     el("deviceName").textContent = result.name;
     el("deviceSub").textContent = result.sub;
     el("lastUpdate").textContent = result.last;
@@ -420,6 +426,78 @@ async function refresh() {
     showError(e.message);
     if (DEBUG) el("rawJson").textContent = "ERRO: " + e.message;
   }
+}
+
+/* ---------------- faturas (referência) ---------------- */
+
+function measuredValue(fields, labelIncludes) {
+  const f = (fields || []).find((x) =>
+    (x.label || "").toLowerCase().includes(labelIncludes)
+  );
+  if (!f) return null;
+  const n = Number(String(f.value).replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function renderBilling(device, result) {
+  const conta = device.source === "supervisory" ? FATURAS.agua : FATURAS.energia;
+  const sec = el("billing");
+  if (!conta) {
+    sec.hidden = true;
+    return;
+  }
+  sec.hidden = false;
+
+  const u = conta.unidade;
+  const tarifa = tarifaEfetiva(conta);
+  const uf = conta.ultimaFatura;
+  const valorUF = uf.valorServicos ?? uf.valorTotal ?? 0;
+
+  el("billingTitle").textContent = `Fatura · ${conta.concessionaria}`;
+  el("billingSub").textContent = conta.hidrometro
+    ? `Hidrômetro ${conta.hidrometro} · medidor oficial da concessionária`
+    : `UC ${conta.uc} · medidor oficial da concessionária`;
+
+  // medição própria (Metam) para comparar/estimar
+  const medidoHoje =
+    device.source === "supervisory" ? measuredValue(result.fields, "hoje") : null;
+
+  const metrics = [];
+  metrics.push({ k: "Última fatura", v: `${fmtNumber(uf.consumo)} <small>${u} · ${uf.mes}</small>` });
+  metrics.push({ k: "Valor da fatura", v: fmtBRL(valorUF) });
+  metrics.push({ k: "Tarifa efetiva", v: `${fmtBRL(tarifa)} <small>/${u}</small>` });
+  if (conta.media6m)
+    metrics.push({ k: "Média 6 meses", v: `${fmtNumber(conta.media6m)} <small>${u}</small>` });
+  if (medidoHoje != null)
+    metrics.push({
+      k: "Custo estimado hoje",
+      v: `${fmtBRL(medidoHoje * tarifa)} <small>~${fmtNumber(medidoHoje)} ${u} medido</small>`,
+      accent: true,
+    });
+
+  el("billingMetrics").innerHTML = metrics
+    .map(
+      (m) =>
+        `<div class="bm${m.accent ? " accent" : ""}"><div class="k">${escapeHtml(
+          m.k
+        )}</div><div class="v">${m.v}</div></div>`
+    )
+    .join("");
+
+  // barras do histórico faturado (últimos meses)
+  const hist = conta.historico.slice(-9);
+  const max = Math.max(...hist.map((h) => h.consumo), 1);
+  el("billingBars").innerHTML = hist
+    .map((h, i) => {
+      const pct = Math.max(3, Math.round((h.consumo / max) * 100));
+      const current = i === hist.length - 1;
+      return `<div class="bar${current ? " current" : ""}"><span class="bval">${fmtNumber(
+        h.consumo
+      )}</span><div class="col" style="height:${pct}%"></div><span class="bmes">${escapeHtml(
+        h.mes
+      )}</span></div>`;
+    })
+    .join("");
 }
 
 function showError(msg) {
@@ -454,6 +532,7 @@ function renderTabs() {
     // estado de carregando ao trocar
     el("cards").innerHTML = '<div class="card skeleton"></div>'.repeat(4);
     el("chartCard").hidden = true;
+    el("billing").hidden = true;
     el("deviceName").textContent = "Carregando…";
     refresh();
   });
