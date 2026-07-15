@@ -96,9 +96,25 @@ export async function handler(event) {
   try {
     const q = event.queryStringParameters || {};
     const action = q.action || "reading";
-    const locationId = q.locationId || process.env.METAM_LOCATION_ID || "71987";
-    const equipmentId = q.equipmentId || process.env.METAM_EQUIPMENT_ID || locationId;
-    const supervisoryId = q.supervisoryId || process.env.METAM_SUPERVISORY_ID || "1940";
+
+    // Allowlist de dispositivos que a página pode consultar. Evita que a função
+    // pública seja usada para enumerar/ler qualquer locationId da conta.
+    const allowed = (process.env.METAM_LOCATION_IDS || "71987,71961")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const defaultId = process.env.METAM_LOCATION_ID || allowed[0] || "71987";
+    const requested = q.locationId || defaultId;
+    const locationId = allowed.includes(String(requested)) ? String(requested) : null;
+    if (!locationId) {
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ error: `locationId não permitido: ${requested}` }),
+      };
+    }
+    const equipmentId = locationId;
+    const supervisoryId = process.env.METAM_SUPERVISORY_ID || "1940";
 
     let data;
     switch (action) {
@@ -113,6 +129,9 @@ export async function handler(event) {
         break;
       case "supervisory": // config do dashboard (widgets)
         data = await api(`/supervisory/${supervisoryId}`);
+        break;
+      case "widget": // valor atual de um widget do supervisório
+        data = await api(`/supervisory/${supervisoryId}/widget/${q.widgetId}`);
         break;
       case "all": // conveniência para inspeção: leitura + campos juntos
         {

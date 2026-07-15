@@ -8,14 +8,24 @@ const API = "/api/metam";
 const params = new URLSearchParams(location.search);
 const DEBUG = params.has("debug");
 
+// Medidores exibidos. Os ids batem com a allowlist da função serverless.
+// - source "reading": lê /last-report/{id} (custom_fields) — ex.: energia
+// - source "supervisory": lê os widgets do dashboard 1940 — ex.: água
+const DEVICES = [
+  { id: "71987", label: "Energia", icon: "energia", source: "reading" },
+  { id: "71961", label: "Água", icon: "agua", source: "supervisory" },
+];
+
 const el = (id) => document.getElementById(id);
 let chart = null;
 let timer = null;
+let activeDevice = DEVICES[0];
 
 /* ---------------- utilidades ---------------- */
 
 async function fetchJSON(action, extra = "") {
-  const r = await fetch(`${API}?action=${action}${extra}`, { cache: "no-store" });
+  const loc = activeDevice ? `&locationId=${encodeURIComponent(activeDevice.id)}` : "";
+  const r = await fetch(`${API}?action=${action}${loc}${extra}`, { cache: "no-store" });
   const text = await r.text();
   let data;
   try {
@@ -245,9 +255,12 @@ function buildSeries(reading) {
   return points.length ? { label: (chosen.description || "").trim(), points } : null;
 }
 
-async function renderHistory(reading) {
-  const series = buildSeries(reading);
-  if (!series) return;
+// Desenha o gráfico a partir de uma série { label, points:[{x,y}] } (qualquer fonte).
+async function drawChart(series) {
+  if (!series || !series.points?.length) {
+    el("chartCard").hidden = true;
+    return;
+  }
   if (!(await ensureChartJs())) return;
 
   el("chartCard").hidden = false;
@@ -285,34 +298,98 @@ async function renderHistory(reading) {
   });
 }
 
+/* ---------------- carregadores por fonte ---------------- */
+
+// Fonte "reading": medidor via /last-report (custom_fields). Ex.: energia.
+async function loadReading() {
+  const reading = await fetchJSON("reading");
+  return {
+    fields: normalize(reading),
+    series: buildSeries(reading),
+    name:
+      reading?.installation_location_description ||
+      reading?.client_name ||
+      "Dispositivo",
+    sub: reading?.client_name
+      ? `${reading.client_name} · IMEI ${reading?.imei || "—"}`
+      : "LifeSense · leitura em tempo real",
+    last: reading?.last_report_date || nowLabel(),
+    debug: reading,
+  };
+}
+
+// Fonte "supervisory": dashboard 1940 (widgets). Ex.: água.
+async function loadSupervisory() {
+  const sup = await fetchJSON("supervisory");
+  const widgets = Array.isArray(sup?.widgets) ? sup.widgets : [];
+
+  // cards = widgets de valor atual
+  const valueWidgets = widgets.filter((w) => /current_value/.test(w.widget_type || ""));
+  const cards = await Promise.all(
+    valueWidgets.map(async (w) => {
+      try {
+        const wd = await fetchJSON("widget", `&widgetId=${w.id}`);
+        return {
+          label: wd.description || w.description || "—",
+          value: wd.data?.value ?? "",
+          unit: wd.data?.unit || "",
+        };
+      } catch {
+        return { label: w.description || "—", value: "", unit: "" };
+      }
+    })
+  );
+
+  // gráfico = primeiro widget de linha com chart_data
+  let series = null;
+  const lineWidget = widgets.find((w) => /line_chart/.test(w.widget_type || ""));
+  if (lineWidget) {
+    try {
+      const wd = await fetchJSON("widget", `&widgetId=${lineWidget.id}`);
+      const cd = wd.data?.chart_data;
+      if (Array.isArray(cd) && cd.length) {
+        series = {
+          label: wd.description || "Histórico",
+          points: cd.map((p) => ({
+            x: shortTime(p.datetime),
+            y: Number(p.value) || 0,
+          })),
+        };
+      }
+    } catch {
+      /* gráfico opcional */
+    }
+  }
+
+  const last = valueWidgets[0]?.last_report || sup?.last_report || nowLabel();
+  return {
+    fields: cards,
+    series,
+    name: activeDevice.label,
+    sub: sup?.description ? `${sup.description}` : "LifeSense · supervisório",
+    last,
+    debug: sup,
+  };
+}
+
 /* ---------------- ciclo principal ---------------- */
 
 async function refresh() {
   try {
-    const reading = await fetchJSON("reading");
-    const fields = normalize(reading);
-    renderCards(fields);
-    renderHistory(reading);
+    const result =
+      activeDevice.source === "supervisory"
+        ? await loadSupervisory()
+        : await loadReading();
 
-    const name =
-      reading?.installation_location_description ||
-      reading?.client_name ||
-      reading?.name ||
-      "Dispositivo";
-    const client = reading?.client_name;
-    el("deviceName").textContent = name;
-    el("deviceSub").textContent = client
-      ? `${client} · IMEI ${reading?.imei || "—"}`
-      : "LifeSense · leitura em tempo real";
-
-    // usa o horário do próprio relatório do Metam quando disponível
-    el("lastUpdate").textContent = reading?.last_report_date || nowLabel();
+    renderCards(result.fields);
+    drawChart(result.series);
+    el("deviceName").textContent = result.name;
+    el("deviceSub").textContent = result.sub;
+    el("lastUpdate").textContent = result.last;
     setStatus("ok", "Online");
-
-    // limpa banner de erro anterior, se houver
     document.querySelector(".banner.live")?.remove();
 
-    if (DEBUG) el("rawJson").textContent = JSON.stringify(reading, null, 2);
+    if (DEBUG) el("rawJson").textContent = JSON.stringify(result.debug, null, 2);
   } catch (e) {
     setStatus("bad", "Falha na leitura");
     showError(e.message);
@@ -330,6 +407,33 @@ function showError(msg) {
   b.textContent = "Erro: " + msg;
 }
 
+function renderTabs() {
+  const nav = el("tabs");
+  if (!nav || DEVICES.length < 2) return; // 1 device só: sem abas
+  nav.innerHTML = DEVICES.map(
+    (d, i) => `
+      <button type="button" class="tab${i === 0 ? " active" : ""}" data-id="${d.id}">
+        <svg class="t-icon" viewBox="0 0 24 24">${ICONS[d.icon] || ICONS.padrao}</svg>
+        ${escapeHtml(d.label)}
+      </button>`
+  ).join("");
+
+  nav.addEventListener("click", (e) => {
+    const btn = e.target.closest(".tab");
+    if (!btn) return;
+    const dev = DEVICES.find((d) => d.id === btn.dataset.id);
+    if (!dev || dev === activeDevice) return;
+    activeDevice = dev;
+    nav.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === btn));
+
+    // estado de carregando ao trocar
+    el("cards").innerHTML = '<div class="card skeleton"></div>'.repeat(4);
+    el("chartCard").hidden = true;
+    el("deviceName").textContent = "Carregando…";
+    refresh();
+  });
+}
+
 function init() {
   el("intervalLabel").textContent = String(REFRESH_MS / 1000);
   if (DEBUG) el("debug").hidden = false;
@@ -338,6 +442,7 @@ function init() {
     navigator.clipboard?.writeText(el("rawJson").textContent || "");
   });
 
+  renderTabs();
   refresh(); // refresh() já alimenta cards e gráfico com a mesma leitura
   timer = setInterval(refresh, REFRESH_MS);
 
