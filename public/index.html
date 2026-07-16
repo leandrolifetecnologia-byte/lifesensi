@@ -2,11 +2,21 @@
 <html lang="pt-BR">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- viewport-fit=cover + safe-area no CSS: respeita o notch quando instalado -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Supervisório · Life Tecnologia</title>
     <meta name="description" content="Supervisório de telemetria em tempo real — Life Tecnologia / LifeSense." />
     <link rel="stylesheet" href="./styles.css" />
     <link rel="icon" type="image/svg+xml" href="./brand/icon-dark-bg.svg" />
+
+    <!-- PWA -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#060a12" />
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="LifeSense" />
   </head>
   <body>
     <header class="topbar">
@@ -19,9 +29,18 @@
           <span>Supervisório · Telemetria</span>
         </div>
       </div>
-      <div class="status" id="status">
-        <span class="dot" id="statusDot"></span>
-        <span id="statusText">Conectando…</span>
+      <div class="top-actions">
+        <button type="button" class="install-btn" id="installBtn" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"
+              fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Instalar
+        </button>
+        <div class="status" id="status">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">Conectando…</span>
+        </div>
       </div>
     </header>
 

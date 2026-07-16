@@ -538,9 +538,39 @@ function renderTabs() {
   });
 }
 
+/* ---------------- PWA (instalar como app) ---------------- */
+
+function initPWA() {
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js").catch(() => {
+      /* SW é progressivo: sem ele o app só perde o offline */
+    });
+  }
+
+  // Android/Chrome: mostra o botão só quando o navegador permite instalar.
+  const btn = el("installBtn");
+  let deferred = null;
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    deferred = e;
+    if (btn) btn.hidden = false;
+  });
+  btn?.addEventListener("click", async () => {
+    if (!deferred) return;
+    deferred.prompt();
+    await deferred.userChoice;
+    deferred = null;
+    btn.hidden = true;
+  });
+  window.addEventListener("appinstalled", () => {
+    if (btn) btn.hidden = true;
+  });
+}
+
 function init() {
   el("intervalLabel").textContent = String(REFRESH_MS / 1000);
   if (DEBUG) el("debug").hidden = false;
+  initPWA();
 
   el("copyRaw")?.addEventListener("click", () => {
     navigator.clipboard?.writeText(el("rawJson").textContent || "");
