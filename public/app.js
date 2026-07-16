@@ -10,13 +10,30 @@ const API = "/api/metam";
 const params = new URLSearchParams(location.search);
 const DEBUG = params.has("debug");
 
-// Medidores exibidos. Os ids batem com a allowlist da função serverless.
-// - source "reading": lê /last-report/{id} (custom_fields) — ex.: energia
-// - source "supervisory": lê os widgets do dashboard 1940 — ex.: água
+// Medidores exibidos. Os ids batem com as allowlists da função serverless.
+// - source "reading": lê /last-report/{id} (custom_fields)
+// - source "supervisory": lê os widgets do dashboard indicado em supervisoryId
+// Entrada Principal usa supervisório porque /last-report/71705 responde 500
+// no Metam (o dispositivo não é servido por esse endpoint).
+// "conta" indica qual fatura de referência exibir (chave em FATURAS).
 const DEVICES = [
-  { id: "71987", label: "Energia", icon: "energia", source: "reading" },
-  { id: "71705", label: "Entrada Principal", icon: "energia", source: "reading" },
-  { id: "71961", label: "Água", icon: "agua", source: "supervisory" },
+  { id: "71987", label: "Energia", icon: "energia", source: "reading", conta: "energia" },
+  {
+    id: "71705",
+    label: "Entrada Principal",
+    icon: "energia",
+    source: "supervisory",
+    supervisoryId: "1843",
+    conta: "energia",
+  },
+  {
+    id: "71961",
+    label: "Água",
+    icon: "agua",
+    source: "supervisory",
+    supervisoryId: "1940",
+    conta: "agua",
+  },
 ];
 
 const el = (id) => document.getElementById(id);
@@ -28,7 +45,10 @@ let activeDevice = DEVICES[0];
 
 async function fetchJSON(action, extra = "") {
   const loc = activeDevice ? `&locationId=${encodeURIComponent(activeDevice.id)}` : "";
-  const r = await fetch(`${API}?action=${action}${loc}${extra}`, { cache: "no-store" });
+  const sup = activeDevice?.supervisoryId
+    ? `&supervisoryId=${encodeURIComponent(activeDevice.supervisoryId)}`
+    : "";
+  const r = await fetch(`${API}?action=${action}${loc}${sup}${extra}`, { cache: "no-store" });
   const text = await r.text();
   let data;
   try {
@@ -324,13 +344,53 @@ async function loadReading() {
   };
 }
 
-// unidade de volume (m³, L) vs vazão (…/h)
-const isVolumeUnit = (u) => /m³$|litro|^l$/i.test(String(u || "").trim());
+// Acumulador = contador que só cresce (hidrômetro m³, energia kWh); o consumo
+// do período é a diferença entre leituras. Taxa = valor instantâneo (m³/h, A…).
+const isAccumUnit = (u) => /^(m³|litros?|l|kwh|wh)$/i.test(String(u || "").trim());
 const isFlowUnit = (u) => /\/h/i.test(String(u || ""));
+// distingue consumo de geração (solar), ambos em kWh
+const isConsumoLabel = (s) => /consum|hidr/i.test(String(s || ""));
 
-// Fonte "supervisory": dashboard 1940 (widgets). Ex.: água.
+// Corrige grafias vindas do cadastro do Metam (ex.: widget "Vasao").
+const LABEL_FIX = { vasao: "Vazão", hidrometro: "Hidrômetro" };
+const prettyLabel = (s) => {
+  const t = String(s || "").trim();
+  return LABEL_FIX[t.toLowerCase()] || t;
+};
+
+// Fonte "supervisory": lê os widgets de um dashboard. Ex.: água (1940),
+// Entrada Principal (1843).
+// A listagem de widgets do Metam é lenta e instável, mas muda raramente.
+// Guarda localmente para a troca de aba não depender dela a cada refresh.
+const SUP_CACHE_KEY = (id) => `lifesense.sup.${id}`;
+const SUP_CACHE_TTL = 24 * 60 * 60 * 1000;
+
+function readSupCache(id) {
+  try {
+    const raw = localStorage.getItem(SUP_CACHE_KEY(id));
+    if (!raw) return null;
+    const { data, ts } = JSON.parse(raw);
+    return Date.now() - ts < SUP_CACHE_TTL ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSupCache(id, data) {
+  try {
+    localStorage.setItem(SUP_CACHE_KEY(id), JSON.stringify({ data, ts: Date.now() }));
+  } catch {
+    /* localStorage cheio/indisponível: só perde o cache */
+  }
+}
+
 async function loadSupervisory() {
-  const sup = await fetchJSON("supervisory");
+  const supId = activeDevice.supervisoryId;
+  let sup = readSupCache(supId);
+  if (!sup) {
+    sup = await fetchJSON("supervisory");
+    if (sup?.widgets) writeSupCache(supId, sup);
+  }
   const widgets = Array.isArray(sup?.widgets) ? sup.widgets : [];
 
   const valueWidgets = widgets.filter((w) => /current_value/.test(w.widget_type || ""));
@@ -350,8 +410,20 @@ async function loadSupervisory() {
     )
   ).filter((v) => v && v.value != null);
 
-  const totalCard = values.find((v) => isVolumeUnit(v.unit)); // acumulador (m³)
-  const flowCard = values.find((v) => isFlowUnit(v.unit)); // vazão (m³/h)
+  // Alguns dashboards repetem o mesmo valor em widgets diferentes (ex.: água
+  // tem "Consumo" e "HIDROMETRO" idênticos). Mantém só a primeira ocorrência.
+  const seen = new Set();
+  const uniqueValues = values.filter((v) => {
+    const k = `${v.value}|${v.unit}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  // Entre os acumuladores, prefere o de consumo — dashboards com solar também
+  // têm "Geração" em kWh, que não pode ser confundida com consumo.
+  const accumCards = uniqueValues.filter((v) => isAccumUnit(v.unit));
+  const totalCard = accumCards.find((v) => isConsumoLabel(v.label)) || accumCards[0];
 
   // gráficos de linha, classificados por unidade
   const lines = (
@@ -367,10 +439,11 @@ async function loadSupervisory() {
     )
   ).filter((l) => l && l.cd.length);
 
-  const accumLine = lines.find((l) => isVolumeUnit(l.unit)); // hidrômetro (m³)
+  const accumLines = lines.filter((l) => isAccumUnit(l.unit)); // hidrômetro (m³) / energia (kWh)
+  const accumLine = accumLines.find((l) => isConsumoLabel(l.desc)) || accumLines[0];
   const flowLine = lines.find((l) => isFlowUnit(l.unit)); // vazão (m³/h)
 
-  // O hidrômetro é acumulativo: o consumo do período é a diferença entre a
+  // O acumulador só cresce: o consumo do período é a diferença entre a
   // primeira e a última leitura da janela (o offset do contador se cancela).
   const consumoDaJanela = (cd) => {
     if (!Array.isArray(cd) || cd.length < 2) return null;
@@ -397,12 +470,20 @@ async function loadSupervisory() {
     }
   }
 
-  const unidadeVol = totalCard?.unit || accumLine?.unit || "m³";
+  const unidadeAcum = accumLine?.unit || totalCard?.unit || "m³";
   const fields = [];
-  if (hoje != null) fields.push({ label: "Consumo Hoje", value: hoje.toFixed(2), unit: unidadeVol });
-  if (mes != null) fields.push({ label: "Consumo Mês Atual", value: mes.toFixed(2), unit: unidadeVol });
-  if (totalCard) fields.push({ label: "Consumo Total", value: totalCard.value, unit: totalCard.unit });
-  if (flowCard) fields.push({ label: "Vazão", value: flowCard.value, unit: flowCard.unit });
+  // Consumo do período primeiro; depois os valores instantâneos do dashboard.
+  if (hoje != null) fields.push({ label: "Consumo Hoje", value: hoje.toFixed(2), unit: unidadeAcum });
+  if (mes != null) fields.push({ label: "Consumo Mês Atual", value: mes.toFixed(2), unit: unidadeAcum });
+  for (const v of uniqueValues) {
+    // só o acumulador de consumo vira "Consumo Total" (geração mantém o nome)
+    const isTotal = v === totalCard && isConsumoLabel(v.label);
+    fields.push({
+      label: isTotal ? "Consumo Total" : prettyLabel(v.label),
+      value: v.value,
+      unit: v.unit,
+    });
+  }
 
   // gráfico principal: vazão (fluxo); cai para o acumulador se não houver
   const chartSrc = flowLine || accumLine;
@@ -444,6 +525,12 @@ async function refresh() {
     if (DEBUG) el("rawJson").textContent = JSON.stringify(result.debug, null, 2);
   } catch (e) {
     setStatus("bad", "Falha na leitura");
+    // não deixa cabeçalho/cards do medidor anterior no ar dando falsa impressão
+    el("deviceName").textContent = activeDevice.label;
+    el("deviceSub").textContent = "Sem leitura no momento";
+    el("cards").innerHTML = "";
+    el("chartCard").hidden = true;
+    el("billing").hidden = true;
     showError(e.message);
     if (DEBUG) el("rawJson").textContent = "ERRO: " + e.message;
   }
@@ -461,7 +548,7 @@ function measuredValue(fields, labelIncludes) {
 }
 
 function renderBilling(device, result) {
-  const conta = device.source === "supervisory" ? FATURAS.agua : FATURAS.energia;
+  const conta = FATURAS[device.conta];
   const sec = el("billing");
   if (!conta) {
     sec.hidden = true;
@@ -479,11 +566,9 @@ function renderBilling(device, result) {
     ? `Hidrômetro ${conta.hidrometro} · medidor oficial da concessionária`
     : `UC ${conta.uc} · medidor oficial da concessionária`;
 
-  // medição própria (Metam) para comparar/estimar
-  const medidoHoje =
-    device.source === "supervisory" ? measuredValue(result.fields, "hoje") : null;
-  const medidoMes =
-    device.source === "supervisory" ? measuredValue(result.fields, "mês") : null;
+  // medição própria (Metam), quando o dispositivo expõe consumo por período
+  const medidoHoje = measuredValue(result.fields, "hoje");
+  const medidoMes = measuredValue(result.fields, "mês");
 
   const metrics = [];
   metrics.push({ k: "Última fatura", v: `${fmtNumber(uf.consumo)} <small>${u} · ${uf.mes}</small>` });

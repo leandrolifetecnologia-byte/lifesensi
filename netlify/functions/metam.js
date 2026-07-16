@@ -9,6 +9,10 @@ const BASE = "https://backend.metam.com.br/api";
 // permanecer "quente" na Netlify.
 let cache = { token: null, refresh: null, exp: 0 };
 
+// Config de dashboards (lista de widgets): raramente muda e é cara de buscar.
+const supCache = new Map(); // supervisoryId -> { data, exp }
+const SUP_TTL_MS = 10 * 60 * 1000;
+
 function decodeExp(jwt) {
   try {
     const payload = JSON.parse(
@@ -114,7 +118,25 @@ export async function handler(event) {
       };
     }
     const equipmentId = locationId;
-    const supervisoryId = process.env.METAM_SUPERVISORY_ID || "1940";
+
+    // Supervisórios permitidos (1940 = Água/LifeEye FLOW, 1843 = Entrada
+    // Principal/LifeEye WATT). Mesma lógica de allowlist do locationId.
+    const allowedSups = (process.env.METAM_SUPERVISORY_IDS || "1940,1843")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const requestedSup =
+      q.supervisoryId || process.env.METAM_SUPERVISORY_ID || allowedSups[0];
+    const supervisoryId = allowedSups.includes(String(requestedSup))
+      ? String(requestedSup)
+      : null;
+    if (!supervisoryId && /^(supervisory|widget)$/.test(action)) {
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ error: `supervisoryId não permitido: ${requestedSup}` }),
+      };
+    }
 
     let data;
     switch (action) {
@@ -127,9 +149,19 @@ export async function handler(event) {
       case "history": // série histórica (equipmentId vem dos widgets do supervisório)
         data = await api(`/equipment/${q.equipmentId || equipmentId}/history`);
         break;
-      case "supervisory": // config do dashboard (widgets)
+      case "supervisory": {
+        // O /supervisory/{id} do Metam é intermitentemente lento (8s a 40s+),
+        // enquanto os widgets em si respondem em ~1s. A lista de widgets muda
+        // raramente, então vale cachear enquanto a função estiver quente.
+        const hit = supCache.get(supervisoryId);
+        if (hit && Date.now() < hit.exp) {
+          data = hit.data;
+          break;
+        }
         data = await api(`/supervisory/${supervisoryId}`);
+        supCache.set(supervisoryId, { data, exp: Date.now() + SUP_TTL_MS });
         break;
+      }
       case "widget": {
         // valor de um widget; period_view opcional (24_hours|day|week|month)
         const wq = new URLSearchParams();
