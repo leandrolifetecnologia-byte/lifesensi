@@ -359,7 +359,7 @@ async function loadSupervisory() {
       lineWidgets.map(async (w) => {
         try {
           const wd = await fetchJSON("widget", `&widgetId=${w.id}&line_chart=true`);
-          return { desc: wd.description, unit: wd.data?.unit || "", cd: wd.data?.chart_data || [] };
+          return { id: w.id, desc: wd.description, unit: wd.data?.unit || "", cd: wd.data?.chart_data || [] };
         } catch {
           return null;
         }
@@ -370,16 +370,37 @@ async function loadSupervisory() {
   const accumLine = lines.find((l) => isVolumeUnit(l.unit)); // hidrômetro (m³)
   const flowLine = lines.find((l) => isFlowUnit(l.unit)); // vazão (m³/h)
 
-  // Consumo Hoje = variação do hidrômetro na janela de hoje (offset se cancela)
-  let hoje = null;
-  if (accumLine && accumLine.cd.length >= 2) {
-    const first = Number(accumLine.cd[0].value);
-    const last = Number(accumLine.cd[accumLine.cd.length - 1].value);
-    if (Number.isFinite(first) && Number.isFinite(last)) hoje = Math.max(0, last - first);
+  // O hidrômetro é acumulativo: o consumo do período é a diferença entre a
+  // primeira e a última leitura da janela (o offset do contador se cancela).
+  const consumoDaJanela = (cd) => {
+    if (!Array.isArray(cd) || cd.length < 2) return null;
+    const first = Number(cd[0].value);
+    const last = Number(cd[cd.length - 1].value);
+    if (!Number.isFinite(first) || !Number.isFinite(last)) return null;
+    return Math.max(0, last - first);
+  };
+
+  // Consumo Hoje: janela padrão do widget já começa à meia-noite.
+  const hoje = accumLine ? consumoDaJanela(accumLine.cd) : null;
+
+  // Consumo Mês Atual: mesmo widget com period_view=month (começa no dia 1º).
+  let mes = null;
+  if (accumLine) {
+    try {
+      const wd = await fetchJSON(
+        "widget",
+        `&widgetId=${accumLine.id}&line_chart=true&period_view=month`
+      );
+      mes = consumoDaJanela(wd.data?.chart_data);
+    } catch {
+      /* mês é opcional: sem ele os demais cards seguem funcionando */
+    }
   }
 
+  const unidadeVol = totalCard?.unit || accumLine?.unit || "m³";
   const fields = [];
-  if (hoje != null) fields.push({ label: "Consumo Hoje", value: hoje.toFixed(2), unit: totalCard?.unit || "m³" });
+  if (hoje != null) fields.push({ label: "Consumo Hoje", value: hoje.toFixed(2), unit: unidadeVol });
+  if (mes != null) fields.push({ label: "Consumo Mês Atual", value: mes.toFixed(2), unit: unidadeVol });
   if (totalCard) fields.push({ label: "Consumo Total", value: totalCard.value, unit: totalCard.unit });
   if (flowCard) fields.push({ label: "Vazão", value: flowCard.value, unit: flowCard.unit });
 
@@ -461,6 +482,8 @@ function renderBilling(device, result) {
   // medição própria (Metam) para comparar/estimar
   const medidoHoje =
     device.source === "supervisory" ? measuredValue(result.fields, "hoje") : null;
+  const medidoMes =
+    device.source === "supervisory" ? measuredValue(result.fields, "mês") : null;
 
   const metrics = [];
   metrics.push({ k: "Última fatura", v: `${fmtNumber(uf.consumo)} <small>${u} · ${uf.mes}</small>` });
@@ -472,6 +495,12 @@ function renderBilling(device, result) {
     metrics.push({
       k: "Custo estimado hoje",
       v: `${fmtBRL(medidoHoje * tarifa)} <small>~${fmtNumber(medidoHoje)} ${u} medido</small>`,
+      accent: true,
+    });
+  if (medidoMes != null)
+    metrics.push({
+      k: "Custo estimado no mês",
+      v: `${fmtBRL(medidoMes * tarifa)} <small>~${fmtNumber(medidoMes)} ${u} medido</small>`,
       accent: true,
     });
 
